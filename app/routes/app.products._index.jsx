@@ -1,0 +1,647 @@
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { useNavigate, useLoaderData } from "react-router";
+import {
+  Page,
+  Card,
+  IndexTable,
+  Text,
+  Badge,
+  Thumbnail,
+  Tabs,
+  Spinner,
+  Banner,
+  Button,
+  ButtonGroup,
+  Popover,
+  ActionList,
+  Icon,
+  TextField,
+  Select,
+  Checkbox,
+  InlineStack,
+  Box,
+} from "@shopify/polaris";
+import { SearchIcon, FilterIcon } from "@shopify/polaris-icons";
+import "/app/css/app.css.products.css";
+
+import { json } from "@remix-run/node";
+import { authenticate } from "../shopify.server";
+
+/* =========================
+   ✅ SERVER: Plan check (Free / Plus / Pro)
+========================= */
+export const loader = async ({ request }) => {
+  const { billing } = await authenticate.admin(request);
+  const { appSubscriptions } = await billing.check();
+
+  const subscription = appSubscriptions?.[0] ?? null;
+  const planNameLower = (subscription?.name || "Free").toLowerCase();
+
+  // ✅ Plan → product selection limit
+  // Free  = 50
+  // Plus  = 100
+  // Pro   = Unlimited
+  let selectionLimit = 50;
+
+  if (planNameLower.includes("plus")) {
+    selectionLimit = 100;
+  } else if (planNameLower.includes("pro")) {
+    selectionLimit = Infinity; // Unlimited
+  }
+
+  return json({
+    isPaid: Boolean(subscription),
+    planName: subscription?.name || "Free",
+    selectionLimit,
+  });
+};
+
+function statusBadgeTone(status) {
+  if (status === "ACTIVE") return "success";
+  if (status === "DRAFT") return "warning";
+  if (status === "ARCHIVED") return "critical";
+  return "info";
+}
+
+function safeNumericId(gidOrId) {
+  if (!gidOrId) return "";
+  return String(gidOrId).includes("/")
+    ? String(gidOrId).split("/").pop()
+    : String(gidOrId);
+}
+
+export default function ProductsPage() {
+  const navigate = useNavigate();
+
+  // ✅ From loader
+  const { isPaid, selectionLimit, planName } = useLoaderData();
+
+  // ✅ Pro = unlimited (Infinity). Use flag for UI + logic.
+  const isUnlimited = !Number.isFinite(selectionLimit); // true when Infinity
+  const limitLabel = isUnlimited ? "Unlimited" : selectionLimit;
+
+  const [products, setProducts] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+
+  const [selectedTab, setSelectedTab] = useState(0);
+
+  const [query, setQuery] = useState("");
+  const [sort, setSort] = useState("title_asc");
+
+  const [filtersOpen, setFiltersOpen] = useState(false);
+  const [filterStatus, setFilterStatus] = useState("ALL");
+
+  const [showSelectedOnly, setShowSelectedOnly] = useState(false);
+
+  const [statusBusy, setStatusBusy] = useState(false);
+  const [bulkMsg, setBulkMsg] = useState("");
+
+  // ✅ shows message when user tries to exceed limit
+  const [limitMsg, setLimitMsg] = useState("");
+
+  // ✅ custom selection (capped like inventory page)
+  const [selectedResources, setSelectedResources] = useState([]);
+  const [allResourcesSelected, setAllResourcesSelected] = useState(false);
+
+  const clearSelection = useCallback(() => {
+    setSelectedResources([]);
+    setAllResourcesSelected(false);
+  }, []);
+
+  useEffect(() => {
+    let alive = true;
+
+    (async () => {
+      try {
+        const res = await fetch("/api/products", {
+          method: "GET",
+          credentials: "include",
+          headers: { Accept: "application/json" },
+        });
+
+        if (!res.ok) {
+          const text = await res.text();
+          throw new Error(text || `API failed: ${res.status}`);
+        }
+
+        const data = await res.json();
+        const list = Array.isArray(data.products) ? data.products : [];
+
+        if (alive) setProducts(list);
+      } catch (e) {
+        if (alive) setError(e?.message || "Failed to load products");
+      } finally {
+        if (alive) setLoading(false);
+      }
+    })();
+
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  const tabs = useMemo(
+    () => [
+      { id: "all", content: "All" },
+      { id: "active", content: "Active" },
+      { id: "draft", content: "Draft" },
+      { id: "archived", content: "Archived" },
+    ],
+    []
+  );
+
+  const onTabChange = useCallback((index) => setSelectedTab(index), []);
+
+  const tabFiltered = useMemo(() => {
+    const tab = tabs[selectedTab]?.id;
+    if (tab === "active") return products.filter((p) => p.status === "ACTIVE");
+    if (tab === "draft") return products.filter((p) => p.status === "DRAFT");
+    if (tab === "archived") return products.filter((p) => p.status === "ARCHIVED");
+    return products;
+  }, [products, selectedTab, tabs]);
+
+  const statusFiltered = useMemo(() => {
+    if (!filterStatus || filterStatus === "ALL") return tabFiltered;
+    return tabFiltered.filter((p) => p.status === filterStatus);
+  }, [tabFiltered, filterStatus]);
+
+  const searched = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    if (!q) return statusFiltered;
+    return statusFiltered.filter((p) => {
+      const title = (p.title || "").toLowerCase();
+      const handle = (p.handle || "").toLowerCase();
+      return title.includes(q) || handle.includes(q);
+    });
+  }, [statusFiltered, query]);
+
+  const sorted = useMemo(() => {
+    const copy = [...searched];
+    if (sort === "title_asc") copy.sort((a, b) => (a.title || "").localeCompare(b.title || ""));
+    if (sort === "title_desc") copy.sort((a, b) => (b.title || "").localeCompare(a.title || ""));
+    if (sort === "status_asc") copy.sort((a, b) => (a.status || "").localeCompare(b.status || ""));
+    if (sort === "status_desc") copy.sort((a, b) => (b.status || "").localeCompare(a.status || ""));
+    if (sort === "inventory_desc")
+      copy.sort((a, b) => (b.totalInventory ?? -1) - (a.totalInventory ?? -1));
+    if (sort === "inventory_asc")
+      copy.sort((a, b) => (a.totalInventory ?? -1) - (b.totalInventory ?? -1));
+    return copy;
+  }, [searched, sort]);
+
+  // visible list respects "showSelectedOnly"
+  const visibleProducts = useMemo(() => {
+    if (!showSelectedOnly) return sorted;
+    if (allResourcesSelected) return sorted;
+    return sorted.filter((p) => selectedResources.includes(p.id));
+  }, [sorted, showSelectedOnly, selectedResources, allResourcesSelected]);
+
+  // if list changes, keep selection only if IDs still exist
+  useEffect(() => {
+    const valid = new Set(sorted.map((p) => p.id));
+    setSelectedResources((prev) => prev.filter((id) => valid.has(id)));
+    setAllResourcesSelected(false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sorted.length]);
+
+  const showBulkBar = selectedResources.length > 0 || allResourcesSelected;
+
+ // ✅ Filter button UI – shows selected filter clearly
+const filterLabelMap = {
+  ALL: "All",
+  ACTIVE: "Active",
+  DRAFT: "Draft",
+  ARCHIVED: "Archived",
+};
+
+const currentFilterLabel = filterLabelMap[filterStatus] || "All";
+const isFilterApplied = filterStatus && filterStatus !== "ALL";
+
+const filterActivator = (
+  <Button
+    icon={<Icon source={FilterIcon} />}
+    onClick={() => setFiltersOpen((v) => !v)}
+    accessibilityLabel="Filters"
+    variant={isFilterApplied ? "primary" : "secondary"}
+  >
+    Filters: {currentFilterLabel}
+  </Button>
+);
+
+
+  // ✅ helper: cap selection (NO CAP for Pro/unlimited)
+  const capSelection = useCallback(
+    (ids) => {
+      const unique = Array.from(new Set(ids));
+
+      // ✅ Pro = unlimited
+      if (isUnlimited) return unique;
+
+      if (unique.length <= selectionLimit) return unique;
+
+      setLimitMsg(
+        `Your ${planName} plan allows selecting up to ${selectionLimit} products. Upgrade to Plus/Pro for more.`
+      );
+
+      return unique.slice(0, selectionLimit);
+    },
+    [isUnlimited, selectionLimit, planName]
+  );
+
+  /* =========================
+     ✅ LIMIT ENFORCEMENT (inventory-style)
+     - Pro: no cap
+     - Free/Plus:
+        - "Select all/page" selects first N
+        - Single/range adds until limit
+  ========================= */
+  const onSelectionChangeLimited = useCallback(
+    (selectionType, toggleType, selection, position) => {
+      // Clear message on new action
+      setLimitMsg("");
+
+      // Deselect all / page
+      if ((selectionType === "all" || selectionType === "page") && toggleType === false) {
+        setSelectedResources([]);
+        setAllResourcesSelected(false);
+        return;
+      }
+
+      // Select all / page
+      if ((selectionType === "all" || selectionType === "page") && toggleType === true) {
+        // ✅ Pro: select everything in current view
+        if (isUnlimited) {
+          setSelectedResources(sorted.map((p) => p.id));
+          setAllResourcesSelected(false);
+          return;
+        }
+
+        // ✅ Free/Plus: cap to first N
+        const firstIds = sorted.map((p) => p.id).slice(0, selectionLimit);
+        setSelectedResources(firstIds);
+        setAllResourcesSelected(false); // we never truly select all
+
+        if (sorted.length > selectionLimit) {
+          setLimitMsg(
+            `Selection limited to first ${selectionLimit} products. Upgrade to Plus/Pro for more.`
+          );
+        }
+        return;
+      }
+
+      // Single row select/deselect
+      if (selectionType === "single" && typeof selection === "string") {
+        setSelectedResources((prev) => {
+          if (toggleType) {
+            return capSelection([...prev, selection]);
+          }
+          return prev.filter((id) => id !== selection);
+        });
+        setAllResourcesSelected(false);
+        return;
+      }
+
+      // Range selection (Shift click)
+      if (selectionType === "range") {
+        let start = null;
+        let end = null;
+
+        if (selection && typeof selection === "object") {
+          start = selection.start ?? null;
+          end = selection.end ?? null;
+        }
+
+        if (Number.isFinite(start) && Number.isFinite(end)) {
+          const lo = Math.min(start, end);
+          const hi = Math.max(start, end);
+
+          // IMPORTANT: positions come from the list you render (visibleProducts)
+          const rangeIds = visibleProducts.slice(lo, hi + 1).map((p) => p.id);
+
+          setSelectedResources((prev) => {
+            if (toggleType) return capSelection([...prev, ...rangeIds]);
+            return prev.filter((id) => !rangeIds.includes(id));
+          });
+
+          setAllResourcesSelected(false);
+        }
+
+        return;
+      }
+
+      // fallback - do nothing
+    },
+    [sorted, selectionLimit, capSelection, visibleProducts, isUnlimited]
+  );
+
+  const selectedCount = allResourcesSelected ? "All" : selectedResources.length;
+
+  // ✅ Pro never reaches limit (no row disable)
+  const selectionLimitReached =
+    !isUnlimited && !allResourcesSelected && selectedResources.length >= selectionLimit;
+
+  // selected products for bulk actions
+  const selectedProducts = useMemo(() => {
+    if (!showBulkBar) return [];
+    const set = new Set(selectedResources);
+    return sorted.filter((p) => set.has(p.id));
+  }, [showBulkBar, selectedResources, sorted]);
+
+  const allSelectedAreActive = useMemo(
+    () => selectedProducts.length > 0 && selectedProducts.every((p) => p.status === "ACTIVE"),
+    [selectedProducts]
+  );
+
+  const allSelectedAreDraft = useMemo(
+    () => selectedProducts.length > 0 && selectedProducts.every((p) => p.status === "DRAFT"),
+    [selectedProducts]
+  );
+
+  const statusLabel = allSelectedAreActive ? "Set Draft" : "Set Active";
+  const nextStatus = allSelectedAreActive ? "DRAFT" : "ACTIVE";
+
+  const statusButtonEnabled = (allSelectedAreActive || allSelectedAreDraft) && !statusBusy;
+
+  const handleStatusChange = useCallback(async () => {
+    const ids = selectedResources;
+    if (!ids.length) return;
+
+    setStatusBusy(true);
+    setBulkMsg("");
+
+    try {
+      const res = await fetch("/api/products/status", {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
+        body: JSON.stringify({
+          status: nextStatus,
+          productIds: ids.map((gid) =>
+            String(gid).includes("/") ? String(gid).split("/").pop() : gid
+          ),
+        }),
+      });
+
+      const data = await res.json().catch(() => ({}));
+
+      const userErr =
+        Array.isArray(data?.userErrors) && data.userErrors.length
+          ? data.userErrors.map((e) => e.message).filter(Boolean).join(", ")
+          : "";
+
+      const errMsg =
+        data?.error || data?.details || userErr || data?.message || "Status update failed";
+
+      if (!res.ok || data?.ok === false) throw new Error(errMsg);
+
+      const selectedSet = new Set(ids);
+      setProducts((prev) =>
+        prev.map((p) => {
+          if (!selectedSet.has(p.id)) return p;
+          return { ...p, status: nextStatus };
+        })
+      );
+
+      setBulkMsg(`${statusLabel} completed for ${ids.length} product(s).`);
+      clearSelection();
+    } catch (e) {
+      setBulkMsg(e?.message || "Something went wrong");
+    } finally {
+      setStatusBusy(false);
+    }
+  }, [selectedResources, nextStatus, statusLabel, clearSelection]);
+
+  if (loading) {
+    return (
+      <Page title="Products">
+        <Card sectioned>
+          <Spinner accessibilityLabel="Loading products" size="large" />
+        </Card>
+      </Page>
+    );
+  }
+
+  return (
+    <Page title="Products">
+      {error ? (
+        <Banner title="Couldn’t load products" tone="critical">
+          <p>{error}</p>
+        </Banner>
+      ) : null}
+
+      {/* ✅ shows limit warning */}
+      {limitMsg ? (
+        <Box padding="300">
+          <Banner title="Selection limit reached" tone="warning">
+            <p>{limitMsg}</p>
+          </Banner>
+        </Box>
+      ) : null}
+
+      {bulkMsg ? (
+        <Box padding="300">
+          <Banner
+            title="Update"
+            tone={bulkMsg.toLowerCase().includes("fail") ? "critical" : "success"}
+          >
+            <p>{bulkMsg}</p>
+          </Banner>
+        </Box>
+      ) : null}
+
+      <Card>
+        <Box padding="300" paddingBlockEnd="0">
+          <InlineStack align="space-between" blockAlign="center" gap="300">
+            <Tabs tabs={tabs} selected={selectedTab} onSelect={onTabChange} />
+
+            <InlineStack gap="300" blockAlign="center">
+              <TextField
+                value={query}
+                onChange={setQuery}
+                placeholder="Search"
+                autoComplete="off"
+                prefix={<Icon source={SearchIcon} />}
+              />
+
+              <Select
+                labelInline
+                label="Sort"
+                options={[
+                  { label: "Title (A–Z)", value: "title_asc" },
+                  { label: "Title (Z–A)", value: "title_desc" },
+                  { label: "Status (A–Z)", value: "status_asc" },
+                  { label: "Status (Z–A)", value: "status_desc" },
+                  { label: "Inventory (High–Low)", value: "inventory_desc" },
+                  { label: "Inventory (Low–High)", value: "inventory_asc" },
+                ]}
+                value={sort}
+                onChange={setSort}
+              />
+
+              <Popover
+                active={filtersOpen}
+                activator={filterActivator}
+                onClose={() => setFiltersOpen(false)}
+              >
+                <ActionList
+                  items={[
+                    {
+                      content: "All statuses",
+                      active: filterStatus === "ALL",
+                      onAction: () => {
+                        setFilterStatus("ALL");
+                        setFiltersOpen(false);
+                      },
+                    },
+                    {
+                      content: "Active",
+                      active: filterStatus === "ACTIVE",
+                      onAction: () => {
+                        setFilterStatus("ACTIVE");
+                        setFiltersOpen(false);
+                      },
+                    },
+                    {
+                      content: "Draft",
+                      active: filterStatus === "DRAFT",
+                      onAction: () => {
+                        setFilterStatus("DRAFT");
+                        setFiltersOpen(false);
+                      },
+                    },
+                    {
+                      content: "Archived",
+                      active: filterStatus === "ARCHIVED",
+                      onAction: () => {
+                        setFilterStatus("ARCHIVED");
+                        setFiltersOpen(false);
+                      },
+                    },
+                  ]}
+                />
+              </Popover>
+            </InlineStack>
+          </InlineStack>
+        </Box>
+
+        {showBulkBar ? (
+          <Box padding="300" paddingBlockStart="200" paddingBlockEnd="200">
+            <InlineStack align="end" blockAlign="center" gap="300">
+              <Checkbox
+                label="Show all selected"
+                checked={showSelectedOnly}
+                onChange={setShowSelectedOnly}
+              />
+
+              <Text as="p" variant="bodySm" tone="subdued">
+                {selectedCount} selected (limit {limitLabel})
+              </Text>
+
+              <ButtonGroup>
+                <Button
+                  onClick={() => {
+                    const ids = selectedResources.map((gid) =>
+                      String(gid).includes("/") ? String(gid).split("/").pop() : String(gid)
+                    );
+                    if (!ids.length) return;
+                    navigate(`/app/bulk-edit?ids=${encodeURIComponent(ids.join(","))}`);
+                  }}
+                >
+                  Bulk edit
+                </Button>
+
+                <Button
+                  loading={statusBusy}
+                  disabled={!statusButtonEnabled}
+                  onClick={handleStatusChange}
+                >
+                  {statusLabel}
+                </Button>
+              </ButtonGroup>
+            </InlineStack>
+          </Box>
+        ) : null}
+
+        <IndexTable
+          resourceName={{ singular: "product", plural: "products" }}
+          itemCount={visibleProducts.length}
+          selectable
+          selectedItemsCount={selectedCount}
+          onSelectionChange={onSelectionChangeLimited}
+          headings={[
+            { title: "Product" },
+            { title: "Status" },
+            { title: "Inventory" },
+            { title: "Category" },
+          ]}
+        >
+          {visibleProducts.map((p, index) => {
+            const image = p.images?.nodes?.[0];
+            const category = p.productCategory?.productTaxonomyNode?.fullName || "Uncategorized";
+            const invNum = typeof p.totalInventory === "number" ? p.totalInventory : null;
+            const inventory = invNum === null ? "—" : `${invNum} in stock`;
+            const numericId = safeNumericId(p.id);
+
+            const isRowSelected = selectedResources.includes(p.id) || allResourcesSelected;
+            const rowDisabled = selectionLimitReached && !isRowSelected;
+
+            return (
+              <IndexTable.Row
+                id={p.id}
+                key={p.id}
+                position={index}
+                selected={isRowSelected}
+                disabled={rowDisabled}
+              >
+                <IndexTable.Cell>
+                  <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+                    <Thumbnail
+                      source={
+                        image?.url ||
+                        "https://cdn.shopify.com/static/images/placeholders/product-1.png"
+                      }
+                      alt={image?.altText || p.title}
+                      size="medium"
+                    />
+
+                    <div>
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          if (rowDisabled) return;
+                          navigate(`/app/products/${numericId}`);
+                        }}
+                        style={{
+                          all: "unset",
+                          cursor: rowDisabled ? "not-allowed" : "pointer",
+                          color: "#005bd3",
+                          fontWeight: 600,
+                          opacity: rowDisabled ? 0.5 : 1,
+                        }}
+                        disabled={rowDisabled}
+                      >
+                        {p.title}
+                      </button>
+
+                      <Text variant="bodySm" tone="subdued" as="p">
+                        {p.handle}
+                      </Text>
+                    </div>
+                  </div>
+                </IndexTable.Cell>
+
+                <IndexTable.Cell>
+                  <Badge tone={statusBadgeTone(p.status)}>{p.status}</Badge>
+                </IndexTable.Cell>
+
+                <IndexTable.Cell>{inventory}</IndexTable.Cell>
+                <IndexTable.Cell>{category}</IndexTable.Cell>
+              </IndexTable.Row>
+            );
+          })}
+        </IndexTable>
+      </Card>
+    </Page>
+  );
+}
